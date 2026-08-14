@@ -2,9 +2,25 @@ function dataList(payload) {
   if (Array.isArray(payload)) return payload.filter((x) => x && typeof x === "object");
   if (!payload || typeof payload !== "object") return [];
   if (Array.isArray(payload.data)) return payload.data.filter((x) => x && typeof x === "object");
-  if (payload.data && typeof payload.data === "object") return [payload.data];
+  if (payload.data && typeof payload.data === "object") {
+    if (Array.isArray(payload.data)) return payload.data.filter((x) => x && typeof x === "object");
+    const numericData = Object.entries(payload.data)
+      .filter(([key, value]) => /^\d+$/.test(key) && value && typeof value === "object")
+      .sort((a, b) => Number(a[0]) - Number(b[0]))
+      .map(([, value]) => value);
+    if (numericData.length) return numericData;
+    return [payload.data];
+  }
   if (Array.isArray(payload.items)) return payload.items.filter((x) => x && typeof x === "object");
   if (Array.isArray(payload.tickets)) return payload.tickets.filter((x) => x && typeof x === "object");
+
+  // Некоторые методы Tickets API возвращают объект с числовыми ключами:
+  // {"0": {...}, "1": {...}} вместо JSON-массива.
+  const numericRows = Object.entries(payload)
+    .filter(([key, value]) => /^\d+$/.test(key) && value && typeof value === "object")
+    .sort((a, b) => Number(a[0]) - Number(b[0]))
+    .map(([, value]) => value);
+  if (numericRows.length) return numericRows;
   return [];
 }
 
@@ -281,51 +297,51 @@ class Chat2DeskAPI {
 
   async ticketsForClient(clientId) {
     const numericClientId = Number(clientId);
-    const requestIds = await this.requestIdsForClient(numericClientId);
-    if (!requestIds.length) return { tickets: [], truncated: false, requestIds: [] };
-    const requestSet = new Set(requestIds.map(Number));
+
+    // Источник истины для связи — сам Ticket: в ответе Chat2Desk у тикета
+    // есть requests[], а в каждом request есть request_id, client_id и dialog_id.
+    // Поэтому сначала сканируем Tickets и фильтруем напрямую по client_id.
+    // Это надёжнее, чем восстанавливать связи только через Messages.
+    const all = await this.allTickets(25);
     const byId = new Map();
+    const directRequestIds = new Set();
 
-    // Сначала смотрим только первую страницу Tickets. Если Chat2Desk отдаёт в ней
-    // связи requests, можем эффективно отфильтровать полный список. Если нет —
-    // не тратим десятки subrequests на бесполезное сканирование и идём напрямую
-    // через request_id.
-    const probe = await this.get("/v1/tickets", { limit: 200, offset: 0 }, true);
-    const probeRows = dataList(probe);
-    const hasRelationshipFields = probeRows.some((ticket) => this.ticketRequestIds(ticket).length > 0);
-    let truncated = false;
+    for (const ticket of all.tickets) {
+      const requests = this.ticketRequests(ticket);
+      const matches = requests.filter((request) => this.requestClientId(request) === numericClientId);
+      if (!matches.length) continue;
+      const id = this.ticketId(ticket);
+      if (id !== null) byId.set(id, ticket);
+      for (const request of matches) {
+        const rid = this.requestId(request);
+        if (rid !== null) directRequestIds.add(rid);
+      }
+    }
 
-    if (hasRelationshipFields) {
-      const all = await this.allTickets(15);
-      truncated = all.truncated;
+    // Диагностика и fallback для API modes, где list Tickets вдруг не содержит
+    // client_id в requests. Получаем известные request_id клиента и проверяем
+    // пересечение с отношениями тикетов.
+    let discoveredRequestIds = [];
+    try {
+      discoveredRequestIds = await this.requestIdsForClient(numericClientId);
+    } catch (error) {
+      console.warn("requestIdsForClient fallback failed", numericClientId, error);
+    }
+    const requestSet = new Set([...directRequestIds, ...discoveredRequestIds].map(Number));
+    if (requestSet.size) {
       for (const ticket of all.tickets) {
         const relations = this.ticketRequestIds(ticket);
-        if (relations.some((rid) => requestSet.has(Number(rid)))) {
-          const id = this.ticketId(ticket);
-          if (id !== null) byId.set(id, ticket);
-        }
+        if (!relations.some((rid) => requestSet.has(Number(rid)))) continue;
+        const id = this.ticketId(ticket);
+        if (id !== null) byId.set(id, ticket);
       }
-    } else {
-      const maxRequestLookups = 25;
-      const ids = requestIds.slice(0, maxRequestLookups);
-      const chunkSize = 5;
-      for (let i = 0; i < ids.length; i += chunkSize) {
-        const chunk = ids.slice(i, i + chunkSize);
-        const groups = await Promise.all(chunk.map((rid) => this.ticketsForRequest(rid)));
-        for (const rows of groups) {
-          for (const ticket of rows) {
-            const id = this.ticketId(ticket);
-            if (id !== null) byId.set(id, ticket);
-          }
-        }
-      }
-      truncated = requestIds.length > maxRequestLookups;
     }
 
     return {
-      tickets: [...byId.values()].sort((a, b) => (this.ticketNumber(b) || 0) - (this.ticketNumber(a) || 0)),
-      truncated,
-      requestIds,
+      tickets: [...byId.values()].sort((a, b) => this.ticketSortValue(b) - this.ticketSortValue(a)),
+      truncated: all.truncated,
+      requestIds: [...requestSet],
+      directRequestIds: [...directRequestIds],
     };
   }
 
@@ -354,11 +370,26 @@ class Chat2DeskAPI {
     const q = String(query || "").trim();
     if (!q) return { tickets: [], truncated: false };
 
-    // Чистый номер — самый быстрый путь.
+    // Число может быть как внутренним id (28723), так и номером из issue_id
+    // (например 910 для TICK-910). Проверяем оба варианта.
     const numberMatch = q.match(/^#?\s*(\d+)\s*$/);
     if (numberMatch) {
-      const ticket = await this.getTicket(Number(numberMatch[1]));
-      return { tickets: ticket ? [ticket] : [], truncated: false, exact: true };
+      const numeric = Number(numberMatch[1]);
+      const found = new Map();
+      const direct = await this.getTicket(numeric);
+      if (direct) {
+        const id = this.ticketId(direct);
+        if (id !== null) found.set(id, direct);
+      }
+      const all = await this.allTickets(25);
+      for (const row of all.tickets) {
+        const id = this.ticketId(row);
+        const issue = String(this.ticketIssueId(row) || "").toLowerCase();
+        if (id === numeric || issue === String(numeric) || issue === `tick-${numeric}` || issue.endsWith(`-${numeric}`)) {
+          if (id !== null) found.set(id, row);
+        }
+      }
+      return { tickets: [...found.values()].slice(0, maxResults), truncated: all.truncated, exact: true };
     }
 
     const needle = q.toLowerCase();
@@ -414,10 +445,30 @@ class Chat2DeskAPI {
   }
 
   ticketId(row) { return asInt(first(row, ["id", "ticket_id", "ticketID", "number"])); }
-  ticketNumber(row) { return asInt(first(row, ["number", "ticket_number", "ticketNumber", "id", "ticket_id", "ticketID"])); }
+  ticketIssueId(row) {
+    const value = first(row, ["issue_id", "issueId", "ticket_number", "ticketNumber", "number"], null);
+    return value === null || value === undefined || value === "" ? null : String(value);
+  }
+  ticketNumber(row) { return this.ticketIssueId(row) || String(this.ticketId(row) ?? "—"); }
+  ticketSortValue(row) {
+    const issue = this.ticketIssueId(row);
+    const match = issue ? issue.match(/(\d+)$/) : null;
+    return match ? Number(match[1]) : (this.ticketId(row) || 0);
+  }
+  ticketRequests(row) {
+    const requests = first(row, ["requests"], []);
+    return Array.isArray(requests) ? requests.filter((x) => x && typeof x === "object") : [];
+  }
+  requestId(row) { return asInt(first(row, ["request_id", "requestID", "requestId", "id"])); }
+  requestClientId(row) { return asInt(first(row, ["client_id", "clientID", "clientId"], row?.client?.id)); }
 
   ticketTitle(row) {
     if (!row || typeof row !== "object") return "Без названия";
+
+    // Реальная схема вашего Chat2Desk: название тикета хранится в `summary`.
+    // Ставим его первым, остальные варианты оставляем для совместимости.
+    const direct = nonEmptyText(first(row, ["summary", "title", "subject", "name", "theme", "topic"], null));
+    if (direct) return direct;
     const preferred = new Set([
       "title", "tickettitle", "name", "ticketname", "subject", "ticketsubject", "theme", "topic",
       "caption", "header", "headline", "summary", "issuetitle", "appealtitle",
@@ -464,9 +515,11 @@ class Chat2DeskAPI {
   }
 
   ticketMatches(row, needle) {
-    const number = String(this.ticketNumber(row) ?? "");
+    const q = String(needle || "").toLowerCase();
+    const displayNumber = String(this.ticketNumber(row) ?? "").toLowerCase();
+    const internalId = String(this.ticketId(row) ?? "").toLowerCase();
     const title = this.ticketTitle(row).toLowerCase();
-    return number.includes(needle) || title.includes(needle);
+    return displayNumber.includes(q) || internalId.includes(q) || title.includes(q);
   }
 
   ticketRawKeys(row) {

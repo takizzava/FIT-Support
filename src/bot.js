@@ -28,7 +28,10 @@ async function showHome(env, chatId, identity) {
 }
 
 function ticketText(api, ticket) {
-  return `🎫 <b>#${esc(api.ticketNumber(ticket) ?? api.ticketId(ticket) ?? "—")}</b>\n<b>${esc(api.ticketTitle(ticket))}</b>\n\nОписание:\n${esc(api.ticketDescription(ticket))}`;
+  const display = api.ticketNumber(ticket) ?? api.ticketId(ticket) ?? "—";
+  const internalId = api.ticketId(ticket);
+  const idSuffix = internalId !== null && String(display) !== String(internalId) ? ` · ID <code>${internalId}</code>` : "";
+  return `🎫 <b>${esc(display)}</b>${idSuffix}\n<b>${esc(api.ticketTitle(ticket))}</b>\n\nОписание:\n${esc(api.ticketDescription(ticket))}`;
 }
 
 function ticketPageText(api, tickets, page, perPage, truncated = false) {
@@ -42,8 +45,8 @@ function ticketPageText(api, tickets, page, perPage, truncated = false) {
 
 function ticketResultKeyboard(api, tickets) {
   const rows = tickets.slice(0, 10).map((ticket) => [{
-    text: `#${api.ticketNumber(ticket) ?? api.ticketId(ticket) ?? "—"} · ${api.ticketTitle(ticket)}`.slice(0, 64),
-    callback_data: `ticket:${api.ticketId(ticket) ?? api.ticketNumber(ticket)}`,
+    text: `${api.ticketNumber(ticket) ?? api.ticketId(ticket) ?? "—"} · ${api.ticketTitle(ticket)}`.slice(0, 64),
+    callback_data: `ticket:${api.ticketId(ticket)}`,
   }]);
   rows.push([{ text: "⬅️ Меню", callback_data: "menu" }]);
   return { inline_keyboard: rows };
@@ -129,12 +132,17 @@ export async function handleTelegramUpdate(env, update) {
         await sendMessage(env, chatId, "Использование: <code>/debug_client 12345</code>");
         return;
       }
-      const requestIds = await api.requestIdsForClient(clientId);
-      const suffix = requestIds.length > 40 ? "\n…показаны первые 40" : "";
+      const result = await api.ticketsForClient(clientId);
+      const requestIds = result.requestIds || [];
+      const requestSuffix = requestIds.length > 40 ? "\n…показаны первые 40 обращений" : "";
+      const ticketLines = (result.tickets || []).slice(0, 30).map((ticket) =>
+        `${esc(api.ticketNumber(ticket))} · <b>${esc(api.ticketTitle(ticket))}</b> · ID <code>${api.ticketId(ticket)}</code>`
+      );
+      const ticketSuffix = (result.tickets || []).length > 30 ? "\n…показаны первые 30 тикетов" : "";
       await sendMessage(
         env,
         chatId,
-        `Client ID: <code>${clientId}</code>\nНайдено обращений: <b>${requestIds.length}</b>\nRequest IDs: <code>${esc(requestIds.slice(0, 40).join(", ") || "—")}</code>${suffix}`,
+        `Client ID: <code>${clientId}</code>\nНайдено обращений: <b>${requestIds.length}</b>\nНайдено тикетов: <b>${(result.tickets || []).length}</b>\n\nRequest IDs: <code>${esc(requestIds.slice(0, 40).join(", ") || "—")}</code>${requestSuffix}\n\n<b>Тикеты:</b>\n${ticketLines.join("\n") || "—"}${ticketSuffix}`,
       );
       return;
     }
