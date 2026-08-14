@@ -208,7 +208,7 @@ export async function handleTelegramUpdate(env, update) {
     if (state?.type === "ticket_search_results") {
       ticket = (state.tickets || []).find((t) => Number(api.ticketId(t)) === id || Number(api.ticketNumber(t)) === id) || null;
     }
-    if (!ticket) ticket = await api.getTicket(id);
+    if (!ticket) ticket = await api.getTicketByInternalId(id);
     await editMessage(env, chatId, cq.message.message_id, ticket ? ticketText(api, ticket) : `Тикет #${id} не найден.`, {
       reply_markup: { inline_keyboard: [[{ text: "⬅️ Меню", callback_data: "menu" }]] },
     });
@@ -267,25 +267,36 @@ export async function handleTelegramUpdate(env, update) {
   }
   if (data === "admin_operators") {
     if (!identity.admin) return;
-    const operators = await api.operators();
-    let dialogs = [];
-    const needsCounts = operators.some((op) => api.operatorDialogsCount(op) === null);
-    if (needsCounts) dialogs = await api.dialogs();
-    const counts = new Map();
-    for (const d of dialogs) {
-      const oid = api.dialogOperatorId(d);
-      if (oid) counts.set(oid, (counts.get(oid) || 0) + 1);
+    await editMessage(env, chatId, cq.message.message_id, "⏳ Загружаю операторов…", {
+      reply_markup: { inline_keyboard: [[{ text: "⬅️ Меню", callback_data: "menu" }]] },
+    }).catch(() => {});
+    try {
+      const operators = await api.operators();
+      let dialogs = [];
+      const needsCounts = operators.some((op) => api.operatorDialogsCount(op) === null);
+      if (needsCounts) dialogs = await api.dialogs();
+      const counts = new Map();
+      for (const d of dialogs) {
+        const oid = api.dialogOperatorId(d);
+        if (oid) counts.set(oid, (counts.get(oid) || 0) + 1);
+      }
+      const lines = operators.map((op) => {
+        const id = api.operatorId(op);
+        const online = api.operatorOnline(op) ? "🟢" : "⚫";
+        const count = api.operatorDialogsCount(op) ?? counts.get(id) ?? 0;
+        const configured = operatorForChat2DeskId(env, id);
+        const displayName = configured?.name || api.operatorName(op);
+        return `${online} <b>${esc(displayName)}</b>\nID: <code>${id ?? "—"}</code> · чатов: ${count}`;
+      });
+      const text = lines.join("\n\n") || "Операторы не найдены.";
+      await editMessage(env, chatId, cq.message.message_id, text.slice(0, 4000), { reply_markup: { inline_keyboard: [[{ text: "🔄 Обновить", callback_data: "admin_operators" }], [{ text: "⬅️ Меню", callback_data: "menu" }]] } });
+    } catch (error) {
+      console.error("admin operators", error);
+      await editMessage(env, chatId, cq.message.message_id, `❌ Не удалось загрузить операторов.\n\n<code>${esc(String(error?.message || error).slice(0, 1200))}</code>`, {
+        reply_markup: { inline_keyboard: [[{ text: "🔄 Повторить", callback_data: "admin_operators" }], [{ text: "⬅️ Меню", callback_data: "menu" }]] },
+      }).catch(() => {});
     }
-    const lines = operators.map((op) => {
-      const id = api.operatorId(op);
-      const online = api.operatorOnline(op) ? "🟢" : "⚫";
-      const count = api.operatorDialogsCount(op) ?? counts.get(id) ?? 0;
-      const configured = operatorForChat2DeskId(env, id);
-      const displayName = configured?.name || api.operatorName(op);
-      return `${online} <b>${esc(displayName)}</b>\nID: <code>${id ?? "—"}</code> · чатов: ${count}`;
-    });
-    const text = lines.join("\n\n") || "Операторы не найдены.";
-    await editMessage(env, chatId, cq.message.message_id, text.slice(0, 4000), { reply_markup: { inline_keyboard: [[{ text: "🔄 Обновить", callback_data: "admin_operators" }], [{ text: "⬅️ Меню", callback_data: "menu" }]] } });
+    return;
   }
 }
 

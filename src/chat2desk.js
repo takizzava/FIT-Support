@@ -1,28 +1,45 @@
 function dataList(payload) {
-  if (Array.isArray(payload)) return payload.filter((x) => x && typeof x === "object");
-  if (!payload || typeof payload !== "object") return [];
-  if (Array.isArray(payload.data)) return payload.data.filter((x) => x && typeof x === "object");
-  if (payload.data && typeof payload.data === "object") {
-    if (Array.isArray(payload.data)) return payload.data.filter((x) => x && typeof x === "object");
-    const numericData = Object.entries(payload.data)
-      .filter(([key, value]) => /^\d+$/.test(key) && value && typeof value === "object")
-      .sort((a, b) => Number(a[0]) - Number(b[0]))
-      .map(([, value]) => value);
-    if (numericData.length) return numericData;
-    return [payload.data];
-  }
-  if (Array.isArray(payload.items)) return payload.items.filter((x) => x && typeof x === "object");
-  if (Array.isArray(payload.tickets)) return payload.tickets.filter((x) => x && typeof x === "object");
+  // Chat2Desk uses several response envelopes across API methods / API modes.
+  // Normalize all known shapes recursively so callers always receive entity rows:
+  //   [row]
+  //   {"0": row, "1": row}
+  //   {data: [...]}
+  //   {data: {"0": row}}
+  //   {data: {tickets: [...]}}
+  //   {result: {operators: [...]}}
+  // Do not treat an entity object itself as a collection unless it sits under
+  // a known singular envelope.
+  const seen = new Set();
 
-  // Некоторые методы Tickets API возвращают объект с числовыми ключами:
-  // {"0": {...}, "1": {...}} вместо JSON-массива.
-  const numericRows = Object.entries(payload)
-    .filter(([key, value]) => /^\d+$/.test(key) && value && typeof value === "object")
-    .sort((a, b) => Number(a[0]) - Number(b[0]))
-    .map(([, value]) => value);
-  if (numericRows.length) return numericRows;
-  return [];
+  function unwrap(value, depth = 0) {
+    if (depth > 8 || value === null || value === undefined) return [];
+    if (Array.isArray(value)) return value.filter((x) => x && typeof x === "object");
+    if (typeof value !== "object") return [];
+    if (seen.has(value)) return [];
+    seen.add(value);
+
+    const numericRows = Object.entries(value)
+      .filter(([key, child]) => /^\d+$/.test(key) && child && typeof child === "object")
+      .sort((a, b) => Number(a[0]) - Number(b[0]))
+      .map(([, child]) => child);
+    if (numericRows.length) return numericRows;
+
+    // Collection/envelope keys observed or commonly used by Chat2Desk APIs.
+    for (const key of [
+      "tickets", "operators", "clients", "dialogs", "messages", "requests",
+      "items", "rows", "records", "results", "result", "data", "response",
+    ]) {
+      if (value[key] === undefined || value[key] === null) continue;
+      const rows = unwrap(value[key], depth + 1);
+      if (rows.length) return rows;
+    }
+
+    return [];
+  }
+
+  return unwrap(payload);
 }
+
 
 function first(obj, keys, fallback = null) {
   for (const key of keys) {
@@ -250,18 +267,23 @@ class Chat2DeskAPI {
   }
 
   async allTickets() {
-    // Реальный Tickets API этого аккаунта возвращает весь список тикетов одним
-    // GET /v1/tickets без limit/offset. Не добавляем неподдерживаемые параметры:
-    // раньше из-за них 4xx скрывался optional=true и превращался в пустой список.
-    const payload = await this.get("/v1/tickets", {}, true);
-    if (!payload) return { tickets: [], truncated: false, source: "empty" };
+    // Tickets are the source of truth for both number/title search and the
+    // ticket.requests[].client_id relationship. Never convert an API error into
+    // an empty list: that previously made a broken request look like “0 tickets”.
+    const payload = await this.get("/v1/tickets", {}, false);
     const rows = dataList(payload);
     const byId = new Map();
     for (const row of rows) {
       const id = this.ticketId(row);
       if (id !== null) byId.set(id, row);
     }
-    return { tickets: [...byId.values()], truncated: false, source: "full-list" };
+    return {
+      tickets: [...byId.values()],
+      truncated: false,
+      source: "GET /v1/tickets",
+      rawShape: this.payloadShape(payload),
+      normalizedRows: rows.length,
+    };
   }
 
   async ticketsForClient(clientId) {
@@ -293,6 +315,8 @@ class Chat2DeskAPI {
         requestIds: [...directRequestIds],
         directRequestIds: [...directRequestIds],
         scannedTickets: all.tickets.length,
+        ticketPayloadShape: all.rawShape || "—",
+        normalizedTicketRows: all.normalizedRows ?? all.tickets.length,
         matchMode: "ticket.requests.client_id",
       };
     }
@@ -320,35 +344,51 @@ class Chat2DeskAPI {
       requestIds: [...requestSet],
       directRequestIds: [],
       scannedTickets: all.tickets.length,
+      ticketPayloadShape: all.rawShape || "—",
+      normalizedTicketRows: all.normalizedRows ?? all.tickets.length,
       matchMode: byId.size ? "request-id-fallback" : "none",
     };
   }
 
-  async getTicket(number) {
-    const raw = String(number || "").trim();
-    const numeric = Number(raw.replace(/^TICK-/i, ""));
-
-    // /tickets/:id работает по внутреннему id. Сначала пробуем его, если введено число.
-    if (Number.isFinite(numeric) && /^\d+$/.test(raw)) {
-      const direct = await this.get(`/v1/tickets/${numeric}`, {}, true);
-      if (direct) {
-        const rows = dataList(direct);
-        if (rows.length) return rows[0];
-        if (typeof direct === "object") {
-          if (direct.data && typeof direct.data === "object" && !Array.isArray(direct.data)) return direct.data;
-          if (direct.id !== undefined || direct.issue_id !== undefined) return direct;
-        }
+  async getTicketByInternalId(id) {
+    const numeric = Number(id);
+    if (!Number.isFinite(numeric)) return null;
+    const direct = await this.get(`/v1/tickets/${Math.trunc(numeric)}`, {}, true);
+    if (!direct) return null;
+    const rows = dataList(direct);
+    if (rows.length) return rows[0];
+    if (typeof direct === "object") {
+      if (direct.data && typeof direct.data === "object" && !Array.isArray(direct.data)) {
+        const nestedRows = dataList(direct.data);
+        if (nestedRows.length) return nestedRows[0];
+        if (direct.data.id !== undefined || direct.data.issue_id !== undefined) return direct.data;
       }
+      if (direct.id !== undefined || direct.issue_id !== undefined) return direct;
     }
+    return null;
+  }
 
-    // Надёжный путь для issue_id (TICK-910 / 910) — полный список без query params.
+  async getTicket(number) {
+    const raw = String(number || "").trim().replace(/^#/, "");
+    if (!raw) return null;
+    const compact = raw.replace(/^TICK-/i, "");
+    const numeric = /^\d+$/.test(compact) ? Number(compact) : null;
+
+    // User-facing ticket number is issue_id (e.g. TICK-910), not internal id 28723.
+    // Search the canonical list first so “910” resolves TICK-910.
     const all = await this.allTickets();
     const needle = raw.toLowerCase();
     for (const row of all.tickets) {
-      const internalId = this.ticketId(row);
       const issue = String(this.ticketIssueId(row) || "").toLowerCase();
-      if (Number.isFinite(numeric) && (internalId === numeric || issue === `tick-${numeric}` || issue.endsWith(`-${numeric}`))) return row;
+      if (numeric !== null && (issue === `tick-${numeric}` || issue.endsWith(`-${numeric}`))) return row;
       if (issue === needle) return row;
+    }
+
+    // If no issue_id matched, allow an explicit internal id as a fallback.
+    if (numeric !== null) {
+      const fromList = all.tickets.find((row) => this.ticketId(row) === numeric);
+      if (fromList) return fromList;
+      return this.getTicketByInternalId(numeric);
     }
     return null;
   }
@@ -384,6 +424,19 @@ class Chat2DeskAPI {
 
     if (exact.length) return { tickets: exact.slice(0, maxResults), truncated: exact.length > maxResults, exact: true };
     return { tickets: partial.slice(0, maxResults), truncated: partial.length > maxResults, exact: false };
+  }
+
+  payloadShape(payload) {
+    if (Array.isArray(payload)) return `array(${payload.length})`;
+    if (!payload || typeof payload !== "object") return typeof payload;
+    const keys = Object.keys(payload).slice(0, 12);
+    const parts = keys.map((key) => {
+      const value = payload[key];
+      if (Array.isArray(value)) return `${key}:array(${value.length})`;
+      if (value && typeof value === "object") return `${key}:object(${Object.keys(value).slice(0, 8).join(",")})`;
+      return `${key}:${typeof value}`;
+    });
+    return `{${parts.join("; ")}}`;
   }
 
   clientId(row) { return asInt(first(row, ["id", "client_id", "clientID"])); }
