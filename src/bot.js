@@ -74,7 +74,7 @@ export async function handleTelegramUpdate(env, update) {
         await sendMessage(env, chatId, "Клиенты не найдены.", { reply_markup: mainKeyboard(identity.admin) });
         return;
       }
-      const keyboard = clients.map((client) => [{ text: api.clientName(client).slice(0, 60), callback_data: `client:${api.clientId(client)}` }]);
+      const keyboard = clients.map((client) => [{ text: api.clientLabel(client).slice(0, 64), callback_data: `client:${api.clientId(client)}` }]);
       keyboard.push([{ text: "⬅️ Меню", callback_data: "menu" }]);
       await sendMessage(env, chatId, `Найдено клиентов: ${clients.length}\nВыберите нужного:`, { reply_markup: { inline_keyboard: keyboard } });
       return;
@@ -118,16 +118,31 @@ export async function handleTelegramUpdate(env, update) {
   }
   if (data.startsWith("client:")) {
     const clientId = Number(data.split(":")[1]);
-    const result = await api.ticketsForClient(clientId);
-    const perPage = Number(env.TICKETS_PER_PAGE || 5);
-    await setUserState(env, identity.user.id, { type: "client_tickets", client_id: clientId, tickets: result.tickets, truncated: result.truncated });
-    const page = ticketPageText(api, result.tickets, 0, perPage, result.truncated);
-    const nav = [];
-    if (page.pages > 1) nav.push({ text: "➡️", callback_data: "tickets_page:1" });
-    const keyboard = [];
-    if (nav.length) keyboard.push(nav);
-    keyboard.push([{ text: "⬅️ Меню", callback_data: "menu" }]);
-    await editMessage(env, chatId, cq.message.message_id, page.text, { reply_markup: { inline_keyboard: keyboard } });
+    // Пользователь сразу видит, что callback принят. Раньше тяжёлый API-chain мог
+    // быть прерван Cloudflare waitUntil и визуально выглядел как "кнопка не работает".
+    await editMessage(env, chatId, cq.message.message_id, `⏳ Загружаю тикеты клиента…\n\nClient ID: <code>${clientId}</code>`, {
+      reply_markup: { inline_keyboard: [[{ text: "⬅️ Меню", callback_data: "menu" }]] },
+    }).catch(() => {});
+
+    try {
+      const result = await api.ticketsForClient(clientId);
+      const perPage = Number(env.TICKETS_PER_PAGE || 5);
+      await setUserState(env, identity.user.id, { type: "client_tickets", client_id: clientId, tickets: result.tickets, truncated: result.truncated });
+      const page = ticketPageText(api, result.tickets, 0, perPage, result.truncated);
+      const nav = [];
+      if (page.pages > 1) nav.push({ text: "➡️", callback_data: "tickets_page:1" });
+      const keyboard = [];
+      if (nav.length) keyboard.push(nav);
+      keyboard.push([{ text: "⬅️ Меню", callback_data: "menu" }]);
+      await editMessage(env, chatId, cq.message.message_id, page.text, { reply_markup: { inline_keyboard: keyboard } });
+    } catch (error) {
+      console.error("client tickets", clientId, error);
+      const message = String(error?.message || error || "Неизвестная ошибка").slice(0, 900);
+      await editMessage(env, chatId, cq.message.message_id,
+        `❌ <b>Не удалось загрузить тикеты клиента.</b>\n\nClient ID: <code>${clientId}</code>\n\n<code>${esc(message)}</code>`,
+        { reply_markup: { inline_keyboard: [[{ text: "⬅️ Меню", callback_data: "menu" }]] } }
+      ).catch(() => {});
+    }
     return;
   }
   if (data.startsWith("tickets_page:")) {

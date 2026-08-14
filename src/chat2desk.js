@@ -91,10 +91,15 @@ class Chat2DeskAPI {
   }
 
   async requestsForClient(clientId) {
+    // Официальный requests (GET) поддерживает фильтрацию; не сканируем всю историю
+    // компании, потому что в Cloudflare Worker это может превратить один callback
+    // в десятки последовательных subrequests.
     const payload = await this.get("/v1/requests", { client_id: clientId, limit: 200, offset: 0 }, true);
-    if (payload && dataList(payload).length) return dataList(payload);
-    const rows = await this.paginated("/v1/requests", {}, 10);
-    return rows.filter((r) => this.requestClientId(r) === Number(clientId));
+    if (!payload) return [];
+    return dataList(payload).filter((r) => {
+      const cid = this.requestClientId(r);
+      return cid === null || cid === Number(clientId);
+    });
   }
 
   ticketRequestIds(row) {
@@ -148,68 +153,77 @@ class Chat2DeskAPI {
     const numericClientId = Number(clientId);
     const requests = await this.requestsForClient(numericClientId);
     const requestIds = [...new Set(requests.map((r) => this.requestId(r)).filter((x) => x !== null))];
+    if (!requestIds.length) return { tickets: [], truncated: false };
+
     const requestSet = new Set(requestIds.map(Number));
     const byId = new Map();
 
-    const addIfRelated = (ticket, trustClientFilter = false) => {
+    const addIfRelated = (ticket) => {
       const tid = this.ticketId(ticket);
       if (tid === null) return;
       const ticketClientId = this.ticketClientId(ticket);
       const relationIds = this.ticketRequestIds(ticket);
       const relatedByClient = ticketClientId !== null && ticketClientId === numericClientId;
       const relatedByRequest = relationIds.some((rid) => requestSet.has(Number(rid)));
-      if (relatedByClient || relatedByRequest || (trustClientFilter && relationIds.length === 0 && ticketClientId === null)) {
-        byId.set(tid, ticket);
-      }
+      if (relatedByClient || relatedByRequest) byId.set(tid, ticket);
     };
 
-    // 1) Самый дешёвый вариант: прямой client_id filter, если он поддерживается API mode.
-    for (const param of ["client_id", "client"]) {
-      const payload = await this.get("/v1/tickets", { [param]: numericClientId, limit: 200, offset: 0 }, true);
+    // 1. Пробуем самые дешёвые серверные фильтры. Они выполняются параллельно,
+    // поэтому один callback не висит на десятках последовательных запросов.
+    const filterCalls = [
+      this.get("/v1/tickets", { client_id: numericClientId, limit: 200, offset: 0 }, true),
+      this.get("/v1/tickets", { request_ids: requestIds.join(","), limit: 200, offset: 0 }, true),
+    ];
+    const filteredPayloads = await Promise.all(filterCalls);
+    for (const payload of filteredPayloads) {
       if (!payload) continue;
-      const rows = dataList(payload);
-      for (const ticket of rows) addIfRelated(ticket, true);
-      // Если ответ содержит явную связь с клиентом/request, этого достаточно.
-      if (byId.size && rows.some((t) => this.ticketClientId(t) !== null || this.ticketRequestIds(t).length)) break;
+      for (const ticket of dataList(payload)) addIfRelated(ticket);
+    }
+    if (byId.size) {
+      return {
+        tickets: [...byId.values()].sort((a, b) => (this.ticketNumber(b) || 0) - (this.ticketNumber(a) || 0)),
+        truncated: false,
+      };
     }
 
-    // 2) Фильтр сразу по request_ids (поддерживается не всеми API modes).
-    if (requestIds.length) {
-      for (let i = 0; i < requestIds.length; i += 40) {
-        const chunk = requestIds.slice(i, i + 40);
-        for (const param of ["request_ids", "requests"]) {
-          const payload = await this.get("/v1/tickets", { [param]: chunk.join(","), limit: 200, offset: 0 }, true);
-          if (!payload) continue;
-          for (const ticket of dataList(payload)) addIfRelated(ticket, false);
-        }
-      }
+    // 2. Надёжный fallback: берём список тикетов. Сначала одну страницу, читаем
+    // meta.total и остальные страницы запрашиваем ПАРАЛЛЕЛЬНО. Это значительно
+    // быстрее прежнего последовательного цикла и укладывается в lifetime Worker.
+    const firstPayload = await this.get("/v1/tickets", { limit: 200, offset: 0 }, true);
+    if (!firstPayload) return { tickets: [], truncated: false };
+    for (const ticket of dataList(firstPayload)) addIfRelated(ticket);
+
+    const total = asInt(firstPayload?.meta?.total) ?? dataList(firstPayload).length;
+    const maxPages = 20; // максимум 4000 тикетов за один callback; защита Cloudflare Free
+    const totalPages = Math.max(1, Math.ceil(total / 200));
+    const pagesToFetch = Math.min(totalPages, maxPages);
+    const calls = [];
+    for (let page = 1; page < pagesToFetch; page += 1) {
+      calls.push(this.get("/v1/tickets", { limit: 200, offset: page * 200 }, true));
+    }
+    const pages = await Promise.all(calls);
+    for (const payload of pages) {
+      if (!payload) continue;
+      for (const ticket of dataList(payload)) addIfRelated(ticket);
     }
 
-    // 3) Надёжный fallback: получаем список Tickets и фильтруем локально по requests.
-    // Это существенно надёжнее десятков последовательных запросов "один request -> tickets"
-    // и укладывается в лимит subrequests Cloudflare Free.
-    if (requestIds.length && byId.size === 0) {
-      const allTickets = await this.paginated("/v1/tickets", {}, 20);
-      for (const ticket of allTickets) addIfRelated(ticket, false);
-    }
-
-    // 4) Последний fallback для аккаунтов, где relation не приходит в общем списке Tickets.
-    // Ограничиваем число requests, чтобы один Telegram callback не превысил лимит subrequests Worker.
-    let truncated = false;
-    if (requestIds.length && byId.size === 0) {
-      const safeIds = requestIds.slice(0, 30);
-      for (const rid of safeIds) {
-        const rows = await this.ticketsForRequest(rid);
+    // 3. Если общий список не содержит relationship-поля, делаем ограниченный
+    // request-specific fallback, но тоже параллельно и не более 12 запросов.
+    if (byId.size === 0) {
+      const safeIds = requestIds.slice(0, 12);
+      const requestResults = await Promise.all(safeIds.map((rid) => this.ticketsForRequest(rid)));
+      for (const rows of requestResults) {
         for (const ticket of rows) {
           const tid = this.ticketId(ticket);
           if (tid !== null) byId.set(tid, ticket);
         }
       }
-      truncated = requestIds.length > safeIds.length;
     }
 
-    const tickets = [...byId.values()].sort((a, b) => (this.ticketNumber(b) || 0) - (this.ticketNumber(a) || 0));
-    return { tickets, truncated };
+    return {
+      tickets: [...byId.values()].sort((a, b) => (this.ticketNumber(b) || 0) - (this.ticketNumber(a) || 0)),
+      truncated: totalPages > maxPages || (byId.size === 0 && requestIds.length > 12),
+    };
   }
 
   async getTicket(number) {
@@ -231,6 +245,18 @@ class Chat2DeskAPI {
 
   clientId(row) { return asInt(first(row, ["id", "client_id", "clientID"])); }
   clientName(row) { return String(first(row, ["assigned_name", "nickname", "name", "client_name"], "Без имени")); }
+  clientLabel(row) {
+    const primary = this.clientName(row);
+    const id = this.clientId(row);
+    const messengerName = String(first(row, ["name", "nickname"], "") || "").trim();
+    const phone = String(first(row, ["client_phone", "phone"], "") || "").trim();
+    const details = [];
+    if (messengerName && messengerName.toLowerCase() !== primary.toLowerCase()) details.push(messengerName);
+    if (phone) details.push(phone);
+    if (id !== null) details.push(`ID ${id}`);
+    const suffix = details.slice(0, 2).join(" · ");
+    return suffix ? `${primary} · ${suffix}` : primary;
+  }
   clientMatches(row, query) {
     const needle = String(query).toLowerCase();
     return ["assigned_name", "nickname", "name", "client_name", "phone", "client_phone", "external_id"]
