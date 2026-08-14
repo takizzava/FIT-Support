@@ -160,7 +160,9 @@ export async function handleTelegramUpdate(env, update) {
       const id = api.operatorId(op);
       const online = api.operatorOnline(op) ? "🟢" : "⚫";
       const count = api.operatorDialogsCount(op) ?? counts.get(id) ?? 0;
-      return `${online} <b>${esc(api.operatorName(op))}</b>\nID: <code>${id ?? "—"}</code> · чатов: ${count}`;
+      const configured = operatorForChat2DeskId(env, id);
+      const displayName = configured?.name || api.operatorName(op);
+      return `${online} <b>${esc(displayName)}</b>\nID: <code>${id ?? "—"}</code> · чатов: ${count}`;
     });
     const text = lines.join("\n\n") || "Операторы не найдены.";
     await editMessage(env, chatId, cq.message.message_id, text.slice(0, 4000), { reply_markup: { inline_keyboard: [[{ text: "🔄 Обновить", callback_data: "admin_operators" }], [{ text: "⬅️ Меню", callback_data: "menu" }]] } });
