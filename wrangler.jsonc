@@ -1,0 +1,35 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "fit-support",
+  "main": "src/index.js",
+  "compatibility_date": "2026-08-14",
+  "workers_dev": true,
+  "observability": {
+    "enabled": true
+  },
+  "triggers": {
+    "crons": ["* * * * *"]
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "BOT_STATE",
+        "class_name": "BotState"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["BotState"]
+    }
+  ],
+  "vars": {
+    "CHAT2DESK_API_BASE": "https://api.chat2desk.com",
+    "ADMIN_TELEGRAM_USERNAMES": "terraktorill,Des_pair",
+    "OPERATOR_MAP_JSON": "[{\"telegram_username\":\"terraktorill\",\"chat2desk_operator_id\":322416,\"name\":\"Роман Онюшкин\"},{\"telegram_username\":\"Meldori\",\"chat2desk_operator_id\":322423,\"name\":\"Егор Латышев\"},{\"telegram_username\":\"looking4victims\",\"chat2desk_operator_id\":322424,\"name\":\"Миртемир Токтогулов\"},{\"telegram_username\":\"Warewarewarewa\",\"chat2desk_operator_id\":326121,\"name\":\"Видана Мартынова\"},{\"telegram_username\":\"qRainyyy\",\"chat2desk_operator_id\":326575,\"name\":\"Эрьян Муратов\"},{\"telegram_username\":\"Des_pair\",\"chat2desk_operator_id\":322395,\"name\":\"Данила Ворончихин\"}]",
+    "CLIENT_SEARCH_MAX_RESULTS": "10",
+    "CLIENT_SEARCH_FALLBACK_PAGES": "10",
+    "TICKETS_PER_PAGE": "5"
+  }
+}
