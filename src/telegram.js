@@ -35,6 +35,21 @@ export async function editMessage(env, chatId, messageId, text, options = {}) {
   });
 }
 
+export async function sendDocument(env, chatId, filename, content, caption = "") {
+  if (!env.TELEGRAM_BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN не задан");
+  const form = new FormData();
+  form.append("chat_id", String(chatId));
+  if (caption) form.append("caption", caption);
+  form.append("document", new File([content], filename, { type: "text/csv;charset=utf-8" }));
+  const response = await fetch(`${TG_BASE}/bot${env.TELEGRAM_BOT_TOKEN}/sendDocument`, {
+    method: "POST",
+    body: form,
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || data.ok === false) throw new Error(`Telegram sendDocument: ${data.description || response.status}`);
+  return data.result;
+}
+
 export async function answerCallback(env, callbackQueryId, text = "") {
   return telegramCall(env, "answerCallbackQuery", {
     callback_query_id: callbackQueryId,
