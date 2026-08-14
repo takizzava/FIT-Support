@@ -249,66 +249,32 @@ class Chat2DeskAPI {
     return [];
   }
 
-  async allTickets(maxPages = 25) {
-    const firstPayload = await this.get("/v1/tickets", { limit: 200, offset: 0 }, true);
-    if (!firstPayload) return { tickets: [], truncated: false };
-    const firstRows = dataList(firstPayload);
+  async allTickets() {
+    // Реальный Tickets API этого аккаунта возвращает весь список тикетов одним
+    // GET /v1/tickets без limit/offset. Не добавляем неподдерживаемые параметры:
+    // раньше из-за них 4xx скрывался optional=true и превращался в пустой список.
+    const payload = await this.get("/v1/tickets", {}, true);
+    if (!payload) return { tickets: [], truncated: false, source: "empty" };
+    const rows = dataList(payload);
     const byId = new Map();
-    for (const row of firstRows) {
+    for (const row of rows) {
       const id = this.ticketId(row);
       if (id !== null) byId.set(id, row);
     }
-
-    const total = asInt(firstPayload?.meta?.total ?? firstPayload?.total ?? firstPayload?.pagination?.total);
-    if (total !== null) {
-      const totalPages = Math.max(1, Math.ceil(total / 200));
-      const pagesToFetch = Math.min(totalPages, maxPages);
-      const calls = [];
-      for (let page = 1; page < pagesToFetch; page += 1) {
-        calls.push(this.get("/v1/tickets", { limit: 200, offset: page * 200 }, true));
-      }
-      const payloads = await Promise.all(calls);
-      for (const payload of payloads) {
-        for (const row of dataList(payload)) {
-          const id = this.ticketId(row);
-          if (id !== null) byId.set(id, row);
-        }
-      }
-      return { tickets: [...byId.values()], truncated: totalPages > maxPages };
-    }
-
-    // Если meta.total отсутствует, дочитываем последовательно до короткой страницы.
-    let offset = firstRows.length;
-    let truncated = false;
-    for (let page = 1; page < maxPages && firstRows.length === 200; page += 1) {
-      const payload = await this.get("/v1/tickets", { limit: 200, offset }, true);
-      if (!payload) break;
-      const rows = dataList(payload);
-      for (const row of rows) {
-        const id = this.ticketId(row);
-        if (id !== null) byId.set(id, row);
-      }
-      offset += rows.length;
-      if (rows.length < 200) return { tickets: [...byId.values()], truncated: false };
-      if (page === maxPages - 1) truncated = true;
-    }
-    return { tickets: [...byId.values()], truncated };
+    return { tickets: [...byId.values()], truncated: false, source: "full-list" };
   }
 
   async ticketsForClient(clientId) {
     const numericClientId = Number(clientId);
-
-    // Источник истины для связи — сам Ticket: в ответе Chat2Desk у тикета
-    // есть requests[], а в каждом request есть request_id, client_id и dialog_id.
-    // Поэтому сначала сканируем Tickets и фильтруем напрямую по client_id.
-    // Это надёжнее, чем восстанавливать связи только через Messages.
-    const all = await this.allTickets(25);
+    const all = await this.allTickets();
     const byId = new Map();
     const directRequestIds = new Set();
 
+    // Главная и проверенная на реальной выгрузке связь:
+    // ticket.requests[].client_id -> выбранный client_id.
     for (const ticket of all.tickets) {
-      const requests = this.ticketRequests(ticket);
-      const matches = requests.filter((request) => this.requestClientId(request) === numericClientId);
+      const matches = this.ticketRequests(ticket)
+        .filter((request) => this.requestClientId(request) === numericClientId);
       if (!matches.length) continue;
       const id = this.ticketId(ticket);
       if (id !== null) byId.set(id, ticket);
@@ -318,20 +284,31 @@ class Chat2DeskAPI {
       }
     }
 
-    // Диагностика и fallback для API modes, где list Tickets вдруг не содержит
-    // client_id в requests. Получаем известные request_id клиента и проверяем
-    // пересечение с отношениями тикетов.
+    // Если прямые связи найдены, ничего больше не запрашиваем. Это и быстрее,
+    // и исключает таймауты Cloudflare на длинных цепочках Messages/Dialogs.
+    if (byId.size > 0) {
+      return {
+        tickets: [...byId.values()].sort((a, b) => this.ticketSortValue(b) - this.ticketSortValue(a)),
+        truncated: false,
+        requestIds: [...directRequestIds],
+        directRequestIds: [...directRequestIds],
+        scannedTickets: all.tickets.length,
+        matchMode: "ticket.requests.client_id",
+      };
+    }
+
+    // Fallback оставляем только для старых/других API modes, где requests[]
+    // отсутствует в списке тикетов.
     let discoveredRequestIds = [];
     try {
       discoveredRequestIds = await this.requestIdsForClient(numericClientId);
     } catch (error) {
       console.warn("requestIdsForClient fallback failed", numericClientId, error);
     }
-    const requestSet = new Set([...directRequestIds, ...discoveredRequestIds].map(Number));
+    const requestSet = new Set(discoveredRequestIds.map(Number));
     if (requestSet.size) {
       for (const ticket of all.tickets) {
-        const relations = this.ticketRequestIds(ticket);
-        if (!relations.some((rid) => requestSet.has(Number(rid)))) continue;
+        if (!this.ticketRequestIds(ticket).some((rid) => requestSet.has(Number(rid)))) continue;
         const id = this.ticketId(ticket);
         if (id !== null) byId.set(id, ticket);
       }
@@ -339,29 +316,39 @@ class Chat2DeskAPI {
 
     return {
       tickets: [...byId.values()].sort((a, b) => this.ticketSortValue(b) - this.ticketSortValue(a)),
-      truncated: all.truncated,
+      truncated: false,
       requestIds: [...requestSet],
-      directRequestIds: [...directRequestIds],
+      directRequestIds: [],
+      scannedTickets: all.tickets.length,
+      matchMode: byId.size ? "request-id-fallback" : "none",
     };
   }
 
   async getTicket(number) {
-    const numeric = Number(number);
-    const direct = await this.get(`/v1/tickets/${numeric}`, {}, true);
-    if (direct) {
-      const rows = dataList(direct);
-      if (rows.length) return rows[0];
-      if (typeof direct === "object") {
-        if (direct.data && typeof direct.data === "object" && !Array.isArray(direct.data)) return direct.data;
-        if (direct.id !== undefined || direct.number !== undefined) return direct;
+    const raw = String(number || "").trim();
+    const numeric = Number(raw.replace(/^TICK-/i, ""));
+
+    // /tickets/:id работает по внутреннему id. Сначала пробуем его, если введено число.
+    if (Number.isFinite(numeric) && /^\d+$/.test(raw)) {
+      const direct = await this.get(`/v1/tickets/${numeric}`, {}, true);
+      if (direct) {
+        const rows = dataList(direct);
+        if (rows.length) return rows[0];
+        if (typeof direct === "object") {
+          if (direct.data && typeof direct.data === "object" && !Array.isArray(direct.data)) return direct.data;
+          if (direct.id !== undefined || direct.issue_id !== undefined) return direct;
+        }
       }
     }
-    for (const param of ["id", "number", "ticket_id"]) {
-      const payload = await this.get("/v1/tickets", { [param]: numeric, limit: 20, offset: 0 }, true);
-      if (!payload) continue;
-      for (const row of dataList(payload)) {
-        if (this.ticketId(row) === numeric || this.ticketNumber(row) === numeric) return row;
-      }
+
+    // Надёжный путь для issue_id (TICK-910 / 910) — полный список без query params.
+    const all = await this.allTickets();
+    const needle = raw.toLowerCase();
+    for (const row of all.tickets) {
+      const internalId = this.ticketId(row);
+      const issue = String(this.ticketIssueId(row) || "").toLowerCase();
+      if (Number.isFinite(numeric) && (internalId === numeric || issue === `tick-${numeric}` || issue.endsWith(`-${numeric}`))) return row;
+      if (issue === needle) return row;
     }
     return null;
   }
@@ -370,58 +357,33 @@ class Chat2DeskAPI {
     const q = String(query || "").trim();
     if (!q) return { tickets: [], truncated: false };
 
-    // Число может быть как внутренним id (28723), так и номером из issue_id
-    // (например 910 для TICK-910). Проверяем оба варианта.
-    const numberMatch = q.match(/^#?\s*(\d+)\s*$/);
-    if (numberMatch) {
-      const numeric = Number(numberMatch[1]);
-      const found = new Map();
-      const direct = await this.getTicket(numeric);
-      if (direct) {
-        const id = this.ticketId(direct);
-        if (id !== null) found.set(id, direct);
-      }
-      const all = await this.allTickets(25);
-      for (const row of all.tickets) {
-        const id = this.ticketId(row);
-        const issue = String(this.ticketIssueId(row) || "").toLowerCase();
-        if (id === numeric || issue === String(numeric) || issue === `tick-${numeric}` || issue.endsWith(`-${numeric}`)) {
-          if (id !== null) found.set(id, row);
-        }
-      }
-      return { tickets: [...found.values()].slice(0, maxResults), truncated: all.truncated, exact: true };
-    }
-
+    // Tickets API этого аккаунта надёжно работает как полный GET /v1/tickets.
+    // Все поисковые фильтры выполняем локально, чтобы не зависеть от неподдерживаемых
+    // query params (search/title/query/limit/offset).
+    const all = await this.allTickets();
     const needle = q.toLowerCase();
-    const found = new Map();
+    const compact = q.replace(/^#/, "").trim();
+    const numericMatch = compact.match(/^\d+$/);
+    const numeric = numericMatch ? Number(compact) : null;
 
-    // Пробуем серверные фильтры, если конкретный API mode их поддерживает.
-    const payloads = await Promise.all([
-      this.get("/v1/tickets", { search: q, limit: 200, offset: 0 }, true),
-      this.get("/v1/tickets", { title: q, limit: 200, offset: 0 }, true),
-      this.get("/v1/tickets", { query: q, limit: 200, offset: 0 }, true),
-    ]);
-    for (const payload of payloads) {
-      for (const row of dataList(payload)) {
-        if (!this.ticketMatches(row, needle)) continue;
-        const id = this.ticketId(row);
-        if (id !== null) found.set(id, row);
+    const exact = [];
+    const partial = [];
+    for (const row of all.tickets) {
+      const id = this.ticketId(row);
+      const issue = String(this.ticketIssueId(row) || "").toLowerCase();
+      const title = this.ticketTitle(row).toLowerCase();
+
+      const exactNumber = numeric !== null && (id === numeric || issue === `tick-${numeric}` || issue.endsWith(`-${numeric}`));
+      const exactIssue = issue === needle;
+      if (exactNumber || exactIssue) {
+        exact.push(row);
+        continue;
       }
+      if (issue.includes(needle) || String(id ?? "").includes(needle) || title.includes(needle)) partial.push(row);
     }
 
-    // Надёжный fallback: локальный поиск по списку тикетов. Chat2Desk UI сам умеет
-    // искать по Number/Title, но название query-параметра Public API зависит от mode.
-    if (found.size < maxResults) {
-      const all = await this.allTickets(25);
-      for (const row of all.tickets) {
-        if (!this.ticketMatches(row, needle)) continue;
-        const id = this.ticketId(row);
-        if (id !== null) found.set(id, row);
-        if (found.size >= maxResults) break;
-      }
-      return { tickets: [...found.values()].slice(0, maxResults), truncated: all.truncated || found.size >= maxResults, exact: false };
-    }
-    return { tickets: [...found.values()].slice(0, maxResults), truncated: found.size > maxResults, exact: false };
+    if (exact.length) return { tickets: exact.slice(0, maxResults), truncated: exact.length > maxResults, exact: true };
+    return { tickets: partial.slice(0, maxResults), truncated: partial.length > maxResults, exact: false };
   }
 
   clientId(row) { return asInt(first(row, ["id", "client_id", "clientID"])); }

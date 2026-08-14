@@ -133,7 +133,11 @@ export async function handleTelegramUpdate(env, update) {
         return;
       }
       const result = await api.ticketsForClient(clientId);
-      const requestIds = result.requestIds || [];
+      const requestIds = await api.requestIdsForClient(clientId).catch((error) => {
+        console.warn("debug requestIdsForClient", clientId, error);
+        return [];
+      });
+      const matchedRequestIds = result.directRequestIds || result.requestIds || [];
       const requestSuffix = requestIds.length > 40 ? "\n…показаны первые 40 обращений" : "";
       const ticketLines = (result.tickets || []).slice(0, 30).map((ticket) =>
         `${esc(api.ticketNumber(ticket))} · <b>${esc(api.ticketTitle(ticket))}</b> · ID <code>${api.ticketId(ticket)}</code>`
@@ -142,7 +146,7 @@ export async function handleTelegramUpdate(env, update) {
       await sendMessage(
         env,
         chatId,
-        `Client ID: <code>${clientId}</code>\nНайдено обращений: <b>${requestIds.length}</b>\nНайдено тикетов: <b>${(result.tickets || []).length}</b>\n\nRequest IDs: <code>${esc(requestIds.slice(0, 40).join(", ") || "—")}</code>${requestSuffix}\n\n<b>Тикеты:</b>\n${ticketLines.join("\n") || "—"}${ticketSuffix}`,
+        `Client ID: <code>${clientId}</code>\nПросканировано тикетов: <b>${result.scannedTickets ?? "—"}</b>\nМетод сопоставления: <code>${esc(result.matchMode || "—")}</code>\nВсего обращений клиента: <b>${requestIds.length}</b>\nОбращений, найденных внутри тикетов: <b>${matchedRequestIds.length}</b>\nНайдено тикетов: <b>${(result.tickets || []).length}</b>\n\nRequest IDs клиента: <code>${esc(requestIds.slice(0, 40).join(", ") || "—")}</code>${requestSuffix}\n\nRequest IDs в тикетах: <code>${esc(matchedRequestIds.slice(0, 40).join(", ") || "—")}</code>\n\n<b>Тикеты:</b>\n${ticketLines.join("\n") || "—"}${ticketSuffix}`,
       );
       return;
     }

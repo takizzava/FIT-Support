@@ -1,6 +1,16 @@
+import { ENV_DEFAULTS } from "./env.generated.js";
 import { handleTelegramUpdate, processAssignments } from "./bot.js";
 import { setWebhook } from "./telegram.js";
 export { BotState } from "./state.js";
+
+function withDefaults(env) {
+  return new Proxy(env, {
+    get(target, prop) {
+      if (Object.prototype.hasOwnProperty.call(ENV_DEFAULTS, prop)) return ENV_DEFAULTS[prop];
+      return target[prop];
+    },
+  });
+}
 
 function json(data, status = 200) {
   return Response.json(data, { status, headers: { "cache-control": "no-store" } });
@@ -8,6 +18,7 @@ function json(data, status = 200) {
 
 export default {
   async fetch(request, env, ctx) {
+    env = withDefaults(env);
     const url = new URL(request.url);
 
     if (url.pathname === "/" || url.pathname === "/health") {
@@ -41,6 +52,7 @@ export default {
   },
 
   async scheduled(controller, env, ctx) {
+    env = withDefaults(env);
     ctx.waitUntil(processAssignments(env).catch((error) => console.error("scheduled assignment check", error)));
   },
 };

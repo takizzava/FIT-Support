@@ -5,8 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev --test-scheduled",
-    "deploy": "wrangler deploy",
-    "test": "node --test"
+    "deploy": "npm run prepare-env && wrangler deploy",
+    "test": "npm run prepare-env && node --test",
+    "prepare-env": "node scripts/generate-env.mjs"
   },
   "devDependencies": {
     "wrangler": "^4.123.0"
