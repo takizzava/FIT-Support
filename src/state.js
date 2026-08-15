@@ -81,9 +81,19 @@ export class BotState extends DurableObject {
       }
       pages.sort((a,b) => a.offset-b.offset);
       const tickets = pages.flatMap((p) => rowsOf(p.payload));
+      const shapeOf = (value, depth = 0) => {
+        if (depth > 2) return typeof value;
+        if (Array.isArray(value)) return `array(${value.length})${value.length ? `[${shapeOf(value[0], depth + 1)}]` : ""}`;
+        if (!value || typeof value !== "object") return typeof value;
+        const keys = Object.keys(value).slice(0, 12);
+        return `{${keys.map((k) => `${k}:${shapeOf(value[k], depth + 1)}`).join(",")}}`;
+      };
       const nextOffset = firstOffset + pages.length * actualLimit;
       const done = total !== null ? nextOffset >= total : rowsOf(pages.at(-1)?.payload).length < actualLimit;
-      return Response.json({ ok: true, tickets, total, limit: actualLimit, next_offset: nextOffset, done, pages: pages.length });
+      return Response.json({
+        ok: true, tickets, total, limit: actualLimit, next_offset: nextOffset, done, pages: pages.length,
+        diagnostic_shape: tickets.length ? shapeOf(tickets[0]) : "empty",
+      });
     }
 
     if (url.pathname === "/assignment-diff" && request.method === "POST") {

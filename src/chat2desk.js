@@ -294,15 +294,21 @@ export class Chat2DeskAPI {
   }
 
   ticketRowsFromPayload(payload) {
-    // /v1/tickets has a stable collection contract in this tenant:
-    // { data: [...], meta: { total, limit, offset }, status: ... }.
-    // Do NOT try to infer whether data[] items are tickets: the endpoint itself
-    // guarantees that. This is deliberately different from generic entity parsing.
+    // First, recursively locate actual ticket entities. This handles the live
+    // Chat2Desk variants we have seen: plain tickets, numeric-key wrappers
+    // such as {"0": {...}}, nested arrays, and data/result/response envelopes.
+    const found = extractTickets(payload);
+    if (found.length) return found;
+
+    // Endpoint-specific fallback. /v1/tickets guarantees that collection rows
+    // represent tickets even when a future API version introduces fields our
+    // recognizer does not know yet. Returning them here preserves diagnostics;
+    // ticketId() will still reject rows without an actual identifier.
     if (Array.isArray(payload)) return payload.filter((row) => row && typeof row === "object");
     if (payload && Array.isArray(payload.data)) return payload.data.filter((row) => row && typeof row === "object");
     if (payload?.result && Array.isArray(payload.result.data)) return payload.result.data.filter((row) => row && typeof row === "object");
     if (payload?.response && Array.isArray(payload.response.data)) return payload.response.data.filter((row) => row && typeof row === "object");
-    return extractTickets(payload);
+    return [];
   }
 
   async allTickets() {
@@ -329,17 +335,25 @@ export class Chat2DeskAPI {
         gatewayCalls += 1;
         total = data.total ?? total;
         actualLimit = data.limit ?? actualLimit;
-        for (const row of data.tickets || []) {
+        for (const rawRow of data.tickets || []) {
           normalizedRows += 1;
-          const id = this.ticketId(row);
-          if (id !== null) byId.set(id, row);
+          // The live tenant can wrap each ticket row (for example {"0": {...}}).
+          // Normalize every gateway row through the endpoint-specific parser instead
+          // of assuming id is located on the first level.
+          const candidates = this.ticketRowsFromPayload(rawRow);
+          for (const row of candidates) {
+            const id = this.ticketId(row);
+            if (id !== null) byId.set(id, row);
+          }
         }
         if (data.done) break;
         const next = Number(data.next_offset);
         if (!Number.isFinite(next) || next <= cursor) throw new Error("Ticket gateway не продвинул offset");
         cursor = next;
       }
-      if (!byId.size && Number(total || 0) > 0) throw new Error(`Ticket gateway получил ${normalizedRows} строк, но ticket id не найден`);
+      if (!byId.size && Number(total || 0) > 0) {
+        throw new Error(`Ticket gateway получил ${normalizedRows} строк, но ticket id не найден. Gateway уже нормализует вложенные ticket wrappers; проверь diagnostic_shape в ответе gateway.`);
+      }
       return { tickets: [...byId.values()], rawShape: `gateway(limit=${actualLimit}, total=${total})`, normalizedRows, source: `DurableObject ticket gateway (${gatewayCalls} chunks)` };
     }
 
@@ -353,7 +367,12 @@ export class Chat2DeskAPI {
       const payload = await this.get("/v1/tickets", { limit: guard === 0 ? 200 : actualLimit, offset });
       const rows = this.ticketRowsFromPayload(payload);
       normalizedRows += rows.length;
-      for (const row of rows) { const id = this.ticketId(row); if (id !== null) byId.set(id,row); }
+      for (const rawRow of rows) {
+        for (const row of this.ticketRowsFromPayload(rawRow)) {
+          const id = this.ticketId(row);
+          if (id !== null) byId.set(id, row);
+        }
+      }
       total = asInt(payload?.meta?.total) ?? total;
       actualLimit = asInt(payload?.meta?.limit) || rows.length || actualLimit;
       const currentOffset = asInt(payload?.meta?.offset) ?? offset;
