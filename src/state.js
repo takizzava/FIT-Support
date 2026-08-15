@@ -97,6 +97,29 @@ export class BotState extends DurableObject {
       }
     }
 
+
+    if (url.pathname === "/client-request-ids-cache") {
+      const clientId = Number(request.method === "POST" ? body.client_id : url.searchParams.get("client_id"));
+      if (!Number.isFinite(clientId)) return Response.json({ ok: false, error: "invalid client_id" }, { status: 400 });
+      const key = `client-request-ids-final:${Math.trunc(clientId)}`;
+
+      if (request.method === "GET") {
+        const cached = await this.ctx.storage.get(key);
+        if (!cached) return Response.json({ ok: true, hit: false });
+        const age = Date.now() - Number(cached.at || 0);
+        const ttl = Number(cached.ttl_ms || 3600000);
+        if (age >= ttl) return Response.json({ ok: true, hit: false });
+        return Response.json({ ok: true, hit: true, request_ids: cached.request_ids || [], age_ms: age });
+      }
+
+      if (request.method === "POST") {
+        const ids = Array.isArray(body.request_ids) ? [...new Set(body.request_ids.map(Number).filter(Number.isFinite).map(Math.trunc))] : [];
+        const ttlMs = Math.max(60000, Math.min(86400000, Number(body.ttl_ms || 3600000)));
+        await this.ctx.storage.put(key, { at: Date.now(), ttl_ms: ttlMs, request_ids: ids });
+        return Response.json({ ok: true, stored: ids.length });
+      }
+    }
+
     if (url.pathname === "/client-request-pages" && request.method === "POST") {
       try {
         const base = String(body.base || "https://api.chat2desk.com").replace(/\/$/, "");

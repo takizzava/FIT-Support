@@ -173,6 +173,15 @@ export class Chat2DeskAPI {
     const stub = this.stateStub();
     if (!stub) return this.requestIdsForClientDirect(numericClientId);
 
+    // The expensive part of client -> tickets lookup is walking the client's
+    // complete message history to collect request_id values. Cache the final,
+    // deduplicated set so subsequent clicks do not replay hundreds of page reads.
+    const cachedResponse = await stub.fetch(`https://state/client-request-ids-cache?client_id=${numericClientId}`);
+    if (cachedResponse.ok) {
+      const cached = await cachedResponse.json();
+      if (cached.hit && Array.isArray(cached.request_ids)) return cached.request_ids;
+    }
+
     const ids = new Set();
     let cursor = null;
     for (let guard = 0; guard < 100; guard += 1) {
@@ -208,7 +217,13 @@ export class Chat2DeskAPI {
       const rid = entityId(dialog, ["last_request_id", "request_id", "requestID", "requestId"]);
       if (rid !== null) ids.add(rid);
     }
-    return [...ids];
+    const result = [...ids];
+    await stub.fetch("https://state/client-request-ids-cache", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ client_id: numericClientId, request_ids: result, ttl_ms: 3600000 }),
+    }).catch(() => {});
+    return result;
   }
 
   async requestIdsForClientDirect(clientId) {
@@ -260,7 +275,7 @@ export class Chat2DeskAPI {
   }
 
   async allTickets() {
-    const rows = await this.gatewayOffsetCollection("/v1/tickets", {}, { cacheTtlMs: 60000, chunkPages: 18 });
+    const rows = await this.gatewayOffsetCollection("/v1/tickets", {}, { cacheTtlMs: 900000, chunkPages: 18 });
     const byKey = new Map();
     for (const row of rows) {
       if (!looksLikeTicket(row)) continue;
