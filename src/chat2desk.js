@@ -108,6 +108,7 @@ function extractMessages(payload) { return deepCollect(payload, isMessage); }
 
 export class Chat2DeskAPI {
   constructor(env) {
+    this.env = env;
     this.base = String(env.CHAT2DESK_API_BASE || "https://api.chat2desk.com").replace(/\/$/, "");
     this.token = env.CHAT2DESK_API_TOKEN;
     if (!this.token) throw new Error("CHAT2DESK_API_TOKEN не задан");
@@ -129,16 +130,16 @@ export class Chat2DeskAPI {
   async operators() {
     const rows = [];
     const seen = new Map();
-    for (let offset = 0; offset < 2000; offset += 200) {
+    let offset = 0;
+    for (let guard = 0; guard < 100; guard += 1) {
       const payload = await this.get("/v1/operators", { limit: 200, offset });
       const page = extractOperators(payload);
-      for (const row of page) {
-        const id = this.operatorId(row);
-        if (id !== null) seen.set(id, row);
-      }
+      for (const row of page) { const id = this.operatorId(row); if (id !== null) seen.set(id, row); }
       const total = asInt(payload?.meta?.total);
-      if (total !== null && seen.size >= total) break;
-      if (page.length < 200) break;
+      const limit = asInt(payload?.meta?.limit) || page.length || 200;
+      const currentOffset = asInt(payload?.meta?.offset) ?? offset;
+      if ((total !== null && currentOffset + page.length >= total) || page.length < limit) break;
+      offset = currentOffset + limit;
     }
     rows.push(...seen.values());
     return rows;
@@ -146,33 +147,26 @@ export class Chat2DeskAPI {
 
   async dialogs() {
     const seen = new Map();
-    // Chat2Desk's documented dialog states are `open` and `closed` (not `opened`).
-    for (let offset = 0; offset < 5000; offset += 200) {
-      const payload = await this.get("/v1/dialogs", { state: "open", limit: 200, offset }, true);
-      if (!payload) break;
-      const page = extractDialogs(payload);
-      for (const row of page) {
-        const id = this.dialogId(row);
-        if (id !== null) seen.set(id, row);
+    const scan = async (params, filterOpen = false) => {
+      let offset = 0;
+      for (let guard = 0; guard < 200; guard += 1) {
+        const payload = await this.get("/v1/dialogs", { ...params, limit: 200, offset }, true);
+        if (!payload) return false;
+        const raw = extractDialogs(payload);
+        const page = filterOpen ? raw.filter((d) => String(d.state || "").toLowerCase() !== "closed") : raw;
+        for (const row of page) { const id = this.dialogId(row); if (id !== null) seen.set(id,row); }
+        const total = asInt(payload?.meta?.total);
+        const limit = asInt(payload?.meta?.limit) || raw.length || 200;
+        const currentOffset = asInt(payload?.meta?.offset) ?? offset;
+        if ((total !== null && currentOffset + raw.length >= total) || raw.length < limit) break;
+        offset = currentOffset + limit;
       }
-      const total = asInt(payload?.meta?.total);
-      if (total !== null && seen.size >= total) break;
-      if (page.length < 200) break;
-    }
-    if (seen.size) return [...seen.values()];
-
-    // Fallback for API modes that do not support `state=open` filtering.
-    for (let offset = 0; offset < 5000; offset += 200) {
-      const payload = await this.get("/v1/dialogs", { limit: 200, offset });
-      const page = extractDialogs(payload).filter((d) => String(d.state || "").toLowerCase() !== "closed");
-      for (const row of page) {
-        const id = this.dialogId(row);
-        if (id !== null) seen.set(id, row);
-      }
-      const total = asInt(payload?.meta?.total);
-      if (total !== null && offset + 200 >= total) break;
-      if (extractDialogs(payload).length < 200) break;
-    }
+      return true;
+    };
+    const supported = await scan({ state: "open" }, false);
+    if (supported && seen.size) return [...seen.values()];
+    seen.clear();
+    await scan({}, true);
     return [...seen.values()];
   }
 
@@ -195,15 +189,20 @@ export class Chat2DeskAPI {
       if (found.size >= maxResults) break;
     }
     if (found.size < maxResults) {
+      let offset = 0;
       for (let page = 0; page < fallbackPages; page += 1) {
-        const payload = await this.get("/v1/clients", { limit: 200, offset: page * 200 });
+        const payload = await this.get("/v1/clients", { limit: 200, offset });
         const rows = extractClients(payload);
         for (const row of rows) {
           const id = this.clientId(row);
           if (id !== null && this.clientMatches(row, q)) found.set(id, row);
           if (found.size >= maxResults) break;
         }
-        if (rows.length < 200 || found.size >= maxResults) break;
+        const total = asInt(payload?.meta?.total);
+        const limit = asInt(payload?.meta?.limit) || rows.length || 200;
+        const currentOffset = asInt(payload?.meta?.offset) ?? offset;
+        if (found.size >= maxResults || (total !== null && currentOffset + rows.length >= total) || rows.length < limit) break;
+        offset = currentOffset + limit;
       }
     }
     return [...found.values()].slice(0, maxResults);
@@ -294,21 +293,76 @@ export class Chat2DeskAPI {
     return all.tickets.filter((ticket) => this.ticketRequestIds(ticket).includes(Number(requestId)));
   }
 
+  ticketRowsFromPayload(payload) {
+    // /v1/tickets has a stable collection contract in this tenant:
+    // { data: [...], meta: { total, limit, offset }, status: ... }.
+    // Do NOT try to infer whether data[] items are tickets: the endpoint itself
+    // guarantees that. This is deliberately different from generic entity parsing.
+    if (Array.isArray(payload)) return payload.filter((row) => row && typeof row === "object");
+    if (payload && Array.isArray(payload.data)) return payload.data.filter((row) => row && typeof row === "object");
+    if (payload?.result && Array.isArray(payload.result.data)) return payload.result.data.filter((row) => row && typeof row === "object");
+    if (payload?.response && Array.isArray(payload.response.data)) return payload.response.data.filter((row) => row && typeof row === "object");
+    return extractTickets(payload);
+  }
+
   async allTickets() {
-    // This account's ticket export is returned by GET /v1/tickets. Do not rely on a
-    // particular envelope: recursively locate ticket-shaped objects anywhere in JSON.
-    const payload = await this.get("/v1/tickets");
-    const rows = extractTickets(payload);
-    if (!rows.length) {
-      throw new Error(`GET /v1/tickets вернул JSON, но тикеты не распознаны. Shape: ${this.payloadShape(payload)}`);
+    // Route large ticket scans through the existing Durable Object. Each DO invocation
+    // fetches at most 18 external pages, so the Free-plan 50-subrequest ceiling is not
+    // tied to Telegram API calls in the parent Worker invocation. Pages are cached in
+    // DO storage for 60 seconds.
+    if (this.env?.BOT_STATE) {
+      const stub = this.env.BOT_STATE.get(this.env.BOT_STATE.idFromName("global"));
+      const byId = new Map();
+      let cursor = 0;
+      let total = null;
+      let actualLimit = null;
+      let gatewayCalls = 0;
+      let normalizedRows = 0;
+      for (let guard = 0; guard < 100; guard += 1) {
+        const response = await stub.fetch("https://state/ticket-pages", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ base: this.base, token: this.token, cursor, requested_limit: 200, max_pages: 18, cache_ttl_ms: 60000 }),
+        });
+        const data = await response.json();
+        if (!response.ok || !data.ok) throw new Error(`Ticket gateway: ${data.error || response.status}`);
+        gatewayCalls += 1;
+        total = data.total ?? total;
+        actualLimit = data.limit ?? actualLimit;
+        for (const row of data.tickets || []) {
+          normalizedRows += 1;
+          const id = this.ticketId(row);
+          if (id !== null) byId.set(id, row);
+        }
+        if (data.done) break;
+        const next = Number(data.next_offset);
+        if (!Number.isFinite(next) || next <= cursor) throw new Error("Ticket gateway не продвинул offset");
+        cursor = next;
+      }
+      if (!byId.size && Number(total || 0) > 0) throw new Error(`Ticket gateway получил ${normalizedRows} строк, но ticket id не найден`);
+      return { tickets: [...byId.values()], rawShape: `gateway(limit=${actualLimit}, total=${total})`, normalizedRows, source: `DurableObject ticket gateway (${gatewayCalls} chunks)` };
     }
+
+    // Local/test fallback.
     const byId = new Map();
-    for (const row of rows) {
-      const id = this.ticketId(row);
-      if (id !== null) byId.set(id, row);
+    let offset = 0;
+    let total = null;
+    let actualLimit = 200;
+    let normalizedRows = 0;
+    for (let guard = 0; guard < 100; guard += 1) {
+      const payload = await this.get("/v1/tickets", { limit: guard === 0 ? 200 : actualLimit, offset });
+      const rows = this.ticketRowsFromPayload(payload);
+      normalizedRows += rows.length;
+      for (const row of rows) { const id = this.ticketId(row); if (id !== null) byId.set(id,row); }
+      total = asInt(payload?.meta?.total) ?? total;
+      actualLimit = asInt(payload?.meta?.limit) || rows.length || actualLimit;
+      const currentOffset = asInt(payload?.meta?.offset) ?? offset;
+      if ((total !== null && currentOffset + rows.length >= total) || rows.length < actualLimit) break;
+      const next = currentOffset + actualLimit;
+      if (next <= offset) throw new Error("GET /v1/tickets pagination stalled");
+      offset = next;
     }
-    if (!byId.size) throw new Error(`GET /v1/tickets: найдено ${rows.length} объектов, но ни у одного нет ticket id`);
-    return { tickets: [...byId.values()], rawShape: this.payloadShape(payload), normalizedRows: rows.length, source: "GET /v1/tickets" };
+    return { tickets:[...byId.values()], rawShape:`direct(total=${total},limit=${actualLimit})`, normalizedRows, source:"GET /v1/tickets paginated" };
   }
 
   async ticketsForClient(clientId) {

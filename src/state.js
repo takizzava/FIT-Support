@@ -5,6 +5,7 @@ export class BotState extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
     this.ctx = ctx;
+    this.env = env;
   }
 
   async fetch(request) {
@@ -32,6 +33,57 @@ export class BotState extends DurableObject {
     if (url.pathname === "/user-state") {
       const value = await this.ctx.storage.get(`state:${url.searchParams.get("user_id")}`);
       return Response.json({ state: value ?? null });
+    }
+
+
+    if (url.pathname === "/ticket-pages" && request.method === "POST") {
+      const base = String(body.base || "https://api.chat2desk.com").replace(/\/$/, "");
+      const token = String(body.token || "");
+      if (!token) return Response.json({ ok: false, error: "missing token" }, { status: 400 });
+      const cursor = Math.max(0, Number(body.cursor || 0));
+      const requestedLimit = Math.max(1, Math.min(200, Number(body.requested_limit || 200)));
+      const maxPages = Math.max(1, Math.min(20, Number(body.max_pages || 18)));
+      const ttlMs = Math.max(0, Number(body.cache_ttl_ms || 60000));
+      const now = Date.now();
+
+      const fetchPage = async (offset, limit) => {
+        const cacheKey = `ticket-page:${offset}:${limit}`;
+        const cached = await this.ctx.storage.get(cacheKey);
+        if (cached && now - Number(cached.at || 0) < ttlMs) return cached.payload;
+        const u = new URL(`${base}/v1/tickets`);
+        u.searchParams.set("limit", String(limit));
+        u.searchParams.set("offset", String(offset));
+        const response = await fetch(u, { headers: { Authorization: token, Accept: "application/json" } });
+        const text = await response.text();
+        if (!response.ok) throw new Error(`Chat2Desk tickets HTTP ${response.status}: ${text.slice(0, 700)}`);
+        const payload = JSON.parse(text);
+        await this.ctx.storage.put(cacheKey, { at: now, payload });
+        return payload;
+      };
+
+      const first = await fetchPage(cursor, requestedLimit);
+      const rowsOf = (payload) => Array.isArray(payload) ? payload : Array.isArray(payload?.data) ? payload.data : [];
+      const firstRows = rowsOf(first);
+      const actualLimit = Math.max(1, Number(first?.meta?.limit || firstRows.length || requestedLimit));
+      const total = Number.isFinite(Number(first?.meta?.total)) ? Number(first.meta.total) : null;
+      const firstOffset = Number(first?.meta?.offset || cursor);
+      const pages = [{ offset: firstOffset, payload: first }];
+      const offsets = [];
+      for (let i = 1; i < maxPages; i += 1) {
+        const offset = firstOffset + i * actualLimit;
+        if (total !== null && offset >= total) break;
+        offsets.push(offset);
+      }
+      for (let i = 0; i < offsets.length; i += 6) {
+        const batch = offsets.slice(i, i + 6);
+        const payloads = await Promise.all(batch.map((offset) => fetchPage(offset, actualLimit)));
+        payloads.forEach((payload, idx) => pages.push({ offset: batch[idx], payload }));
+      }
+      pages.sort((a,b) => a.offset-b.offset);
+      const tickets = pages.flatMap((p) => rowsOf(p.payload));
+      const nextOffset = firstOffset + pages.length * actualLimit;
+      const done = total !== null ? nextOffset >= total : rowsOf(pages.at(-1)?.payload).length < actualLimit;
+      return Response.json({ ok: true, tickets, total, limit: actualLimit, next_offset: nextOffset, done, pages: pages.length });
     }
 
     if (url.pathname === "/assignment-diff" && request.method === "POST") {
