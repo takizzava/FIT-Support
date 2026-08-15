@@ -108,7 +108,14 @@ export async function handleTelegramUpdate(env, update) {
     if (state?.type === "await_ticket_query") {
       await setUserState(env, identity.user.id, null);
       await sendMessage(env, chatId, `⏳ Ищу тикеты по запросу: <b>${esc(text)}</b>`).catch(() => {});
-      const result = await api.searchTickets(text, 10);
+      let result;
+      try {
+        result = await api.searchTickets(text, 10);
+      } catch (error) {
+        console.error("ticket search", text, error);
+        await sendMessage(env, chatId, `❌ Не удалось получить тикеты из Chat2Desk.\n\n<code>${esc(String(error?.message || error).slice(0, 1200))}</code>`, { reply_markup: mainKeyboard(identity.admin) });
+        return;
+      }
       if (!result.tickets.length) {
         await sendMessage(env, chatId, "Тикеты не найдены.", { reply_markup: mainKeyboard(identity.admin) });
         return;
@@ -271,10 +278,10 @@ export async function handleTelegramUpdate(env, update) {
       reply_markup: { inline_keyboard: [[{ text: "⬅️ Меню", callback_data: "menu" }]] },
     }).catch(() => {});
     try {
-      const operators = await api.operators();
-      let dialogs = [];
-      const needsCounts = operators.some((op) => api.operatorDialogsCount(op) === null);
-      if (needsCounts) dialogs = await api.dialogs();
+      const [operators, dialogs] = await Promise.all([api.operators(), api.dialogs().catch((error) => {
+        console.warn("dialogs for operator dashboard", error);
+        return [];
+      })]);
       const counts = new Map();
       for (const d of dialogs) {
         const oid = api.dialogOperatorId(d);
@@ -283,7 +290,11 @@ export async function handleTelegramUpdate(env, update) {
       const lines = operators.map((op) => {
         const id = api.operatorId(op);
         const online = api.operatorOnline(op) ? "🟢" : "⚫";
-        const count = api.operatorDialogsCount(op) ?? counts.get(id) ?? 0;
+        const apiCount = api.operatorDialogsCount(op);
+        const dialogCount = counts.get(id);
+        // Prefer the larger non-null value. Some API modes transiently return
+        // opened_dialogs=0 even while open dialogs are present.
+        const count = Math.max(apiCount ?? 0, dialogCount ?? 0);
         const configured = operatorForChat2DeskId(env, id);
         const displayName = configured?.name || api.operatorName(op);
         return `${online} <b>${esc(displayName)}</b>\nID: <code>${id ?? "—"}</code> · чатов: ${count}`;
