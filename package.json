@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "wrangler dev --test-scheduled",
     "deploy": "npm run prepare-env && wrangler deploy",
-    "test": "npm run prepare-env && node --test",
+    "test": "npm run prepare-env && node --experimental-loader ./test/loader.mjs --test test/*.test.js",
     "prepare-env": "node scripts/generate-env.mjs"
   },
   "devDependencies": {

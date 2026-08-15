@@ -46,7 +46,7 @@ function ticketPageText(api, tickets, page, perPage, truncated = false) {
 function ticketResultKeyboard(api, tickets) {
   const rows = tickets.slice(0, 10).map((ticket) => [{
     text: `${api.ticketNumber(ticket) ?? api.ticketId(ticket) ?? "—"} · ${api.ticketTitle(ticket)}`.slice(0, 64),
-    callback_data: `ticket:${api.ticketId(ticket)}`,
+    callback_data: `ticket:${encodeURIComponent(api.ticketId(ticket) || "")}`,
   }]);
   rows.push([{ text: "⬅️ Меню", callback_data: "menu" }]);
   return { inline_keyboard: rows };
@@ -147,7 +147,7 @@ export async function handleTelegramUpdate(env, update) {
       const matchedRequestIds = result.directRequestIds || result.requestIds || [];
       const requestSuffix = requestIds.length > 40 ? "\n…показаны первые 40 обращений" : "";
       const ticketLines = (result.tickets || []).slice(0, 30).map((ticket) =>
-        `${esc(api.ticketNumber(ticket))} · <b>${esc(api.ticketTitle(ticket))}</b> · ID <code>${api.ticketId(ticket)}</code>`
+        `${esc(api.ticketNumber(ticket))} · <b>${esc(api.ticketTitle(ticket))}</b>`
       );
       const ticketSuffix = (result.tickets || []).length > 30 ? "\n…показаны первые 30 тикетов" : "";
       await sendMessage(
@@ -209,14 +209,14 @@ export async function handleTelegramUpdate(env, update) {
     return;
   }
   if (data.startsWith("ticket:")) {
-    const id = Number(data.split(":")[1]);
+    const ticketKey = decodeURIComponent(data.slice("ticket:".length));
     let ticket = null;
     const state = await getUserState(env, identity.user.id);
     if (state?.type === "ticket_search_results") {
-      ticket = (state.tickets || []).find((t) => Number(api.ticketId(t)) === id || Number(api.ticketNumber(t)) === id) || null;
+      ticket = (state.tickets || []).find((t) => String(api.ticketId(t)) === String(ticketKey)) || null;
     }
-    if (!ticket) ticket = await api.getTicketByInternalId(id);
-    await editMessage(env, chatId, cq.message.message_id, ticket ? ticketText(api, ticket) : `Тикет #${id} не найден.`, {
+    if (!ticket) ticket = await api.getTicket(ticketKey);
+    await editMessage(env, chatId, cq.message.message_id, ticket ? ticketText(api, ticket) : `Тикет ${esc(ticketKey)} не найден.`, {
       reply_markup: { inline_keyboard: [[{ text: "⬅️ Меню", callback_data: "menu" }]] },
     });
     return;
@@ -278,23 +278,11 @@ export async function handleTelegramUpdate(env, update) {
       reply_markup: { inline_keyboard: [[{ text: "⬅️ Меню", callback_data: "menu" }]] },
     }).catch(() => {});
     try {
-      const [operators, dialogs] = await Promise.all([api.operators(), api.dialogs().catch((error) => {
-        console.warn("dialogs for operator dashboard", error);
-        return [];
-      })]);
-      const counts = new Map();
-      for (const d of dialogs) {
-        const oid = api.dialogOperatorId(d);
-        if (oid) counts.set(oid, (counts.get(oid) || 0) + 1);
-      }
+      const operators = await api.operators();
       const lines = operators.map((op) => {
         const id = api.operatorId(op);
         const online = api.operatorOnline(op) ? "🟢" : "⚫";
-        const apiCount = api.operatorDialogsCount(op);
-        const dialogCount = counts.get(id);
-        // Prefer the larger non-null value. Some API modes transiently return
-        // opened_dialogs=0 even while open dialogs are present.
-        const count = Math.max(apiCount ?? 0, dialogCount ?? 0);
+        const count = api.operatorDialogsCount(op);
         const configured = operatorForChat2DeskId(env, id);
         const displayName = configured?.name || api.operatorName(op);
         return `${online} <b>${esc(displayName)}</b>\nID: <code>${id ?? "—"}</code> · чатов: ${count}`;
